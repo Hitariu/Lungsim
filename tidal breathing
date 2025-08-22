@@ -1,0 +1,43 @@
+#include <Servo.h>
+Servo esc1;  // Motor 1 (Inspiration)
+Servo esc2;  // Motor 2 (Exspiration)
+
+const int ESC1_PIN = 9;
+const int ESC2_PIN = 11;
+
+// PWM-Grenzen
+const int PWM_MIN_US = 1000;   // Aus
+const int PWM_MAX_US = 2000;   // Vollgas
+const int PWM_IDLE_US = 1136;  // 1% (Anlaufbereich, nach Kalibrierung)
+
+void setup() {
+  esc1.attach(ESC1_PIN);
+  esc2.attach(ESC2_PIN);
+
+  // beide ESCs armen
+  esc1.writeMicroseconds(PWM_MIN_US);
+  esc2.writeMicroseconds(PWM_MIN_US);
+  delay(3000); // Warten bis ESCs bereit sind
+
+  Serial.begin(9600);
+  Serial.println("System gestartet: Motor 1 und 2 laufen abwechselnd mit 1% für 800ms.");
+}
+
+void loop() {
+  // Motor 1 an
+  esc1.writeMicroseconds(PWM_IDLE_US);
+  esc2.writeMicroseconds(PWM_MIN_US);
+  Serial.println("Motor 1: 1% für 800ms");
+  delay(800);
+
+  // Motor 1 aus
+  esc1.writeMicroseconds(PWM_MIN_US);
+
+  // Motor 2 an
+  esc2.writeMicroseconds(PWM_IDLE_US);
+  Serial.println("Motor 2: 1% für 800ms");
+  delay(800);
+
+  // Motor 2 aus
+  esc2.writeMicroseconds(PWM_MIN_US);
+}
