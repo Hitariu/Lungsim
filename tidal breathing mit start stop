@@ -1,0 +1,78 @@
+#include <Servo.h>
+Servo esc1;  // Motor 1 (Inspiration)
+Servo esc2;  // Motor 2 (Exspiration)
+
+const int ESC1_PIN = 9;
+const int ESC2_PIN = 11;
+
+// Taster
+const int BTN_START = 2;   // Start (Taster 1)
+const int BTN_STOP  = 4;   // Stop  (Taster 3)
+
+// PWM-Grenzen
+const int PWM_MIN_US  = 1000;  // Aus
+const int PWM_MAX_US  = 2000;  // Vollgas
+const int PWM_IDLE_US = 1136;  // 1% (Anlauf)
+
+bool running = false; // Status: läuft / gestoppt
+
+void setup() {
+  esc1.attach(ESC1_PIN);
+  esc2.attach(ESC2_PIN);
+
+  // ESCs armen
+  esc1.writeMicroseconds(PWM_MIN_US);
+  esc2.writeMicroseconds(PWM_MIN_US);
+  delay(3000); // ESC bereit
+
+  pinMode(BTN_START, INPUT_PULLUP);
+  pinMode(BTN_STOP,  INPUT_PULLUP);
+
+  Serial.begin(9600);
+  Serial.println("System gestartet. Drücke START (Taster 1) um zu beginnen.");
+}
+
+void loop() {
+  // Startknopf prüfen
+  if (digitalRead(BTN_START) == LOW && !running) {
+    running = true;
+    Serial.println(">>> START gedrückt: Zyklus gestartet");
+    delay(300); // Entprellen
+  }
+
+  // Stopknopf prüfen
+  if (digitalRead(BTN_STOP) == LOW && running) {
+    running = false;
+    stopMotors();
+    Serial.println(">>> STOP gedrückt: Motoren gestoppt");
+    delay(300); // Entprellen
+  }
+
+  // Ablauf nur wenn running = true
+  if (running) {
+    // Motor 1 an
+    esc1.writeMicroseconds(PWM_IDLE_US);
+    esc2.writeMicroseconds(PWM_MIN_US);
+    Serial.println("Motor 1: 1% für 800ms");
+    delay(800);
+
+    // Motor 1 aus
+    esc1.writeMicroseconds(PWM_MIN_US);
+
+    // Stop zwischendurch prüfen
+    if (!running) return;
+
+    // Motor 2 an
+    esc2.writeMicroseconds(PWM_IDLE_US);
+    Serial.println("Motor 2: 1% für 800ms");
+    delay(800);
+
+    // Motor 2 aus
+    esc2.writeMicroseconds(PWM_MIN_US);
+  }
+}
+
+void stopMotors() {
+  esc1.writeMicroseconds(PWM_MIN_US);
+  esc2.writeMicroseconds(PWM_MIN_US);
+}
