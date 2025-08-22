@@ -1,0 +1,109 @@
+#include <Servo.h>
+Servo escInsp;   // ESC Motor 1
+Servo escExp;    // ESC Motor 2
+
+// ESC Pins
+const int ESC_INSP_PIN = 9;
+const int ESC_EXP_PIN  = 11;
+
+// PWM-Grenzen
+const int PWM_MIN_US = 1000;   // Minimum (aus)
+const int PWM_MAX_US = 2000;   // Testweise bis 2000 µs
+
+// Stop-Taster
+const int BTN_STOP = 4;
+
+// aktuelle PWM-Werte
+int pwmInsp = PWM_MIN_US;
+int pwmExp  = PWM_MIN_US;
+
+void setup() {
+  escInsp.attach(ESC_INSP_PIN);
+  escExp.attach(ESC_EXP_PIN);
+
+  // ESCs armen
+  escInsp.writeMicroseconds(PWM_MIN_US);
+  escExp.writeMicroseconds(PWM_MIN_US);
+  delay(3000);
+
+  pinMode(BTN_STOP, INPUT_PULLUP);
+
+  Serial.begin(9600);
+  Serial.println("System bereit.");
+  Serial.println("Konsole: 'motor1 10', 'motor2 50', 'stop'");
+  Serial.println("Bereich: 1000–2000 µs (0–100 %)");
+  Serial.println("Taster D4 = Not-Stop");
+}
+
+void loop() {
+  // ===== Konsole auswerten =====
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+
+    if (input.startsWith("motor1")) {
+      int val = input.substring(6).toInt();
+      setMotor(1, val);
+    } 
+    else if (input.startsWith("motor2")) {
+      int val = input.substring(6).toInt();
+      setMotor(2, val);
+    } 
+    else if (input.equalsIgnoreCase("stop")) {
+      stopMotors();
+      Serial.println(">> Beide Motoren gestoppt (Konsole).");
+    } 
+    else {
+      Serial.println("Unbekannter Befehl! Syntax: motor1 <0-100>, motor2 <0-100>, stop");
+    }
+  }
+
+  // ===== Stop-Taster prüfen =====
+  if (digitalRead(BTN_STOP) == LOW) {
+    stopMotors();
+    Serial.println(">> STOP-Taster gedrückt: Motoren aus.");
+    delay(300); // Entprellen
+  }
+
+  // ===== ESC-Signale senden =====
+  escInsp.writeMicroseconds(pwmInsp);
+  escExp.writeMicroseconds(pwmExp);
+
+  delay(20);
+}
+
+// ===== Hilfsfunktionen =====
+void setMotor(int motor, int percent) {
+  percent = constrain(percent, 0, 100);
+  int pwmVal;
+
+  if (percent == 0) {
+    pwmVal = PWM_MIN_US;  // Motor aus
+  } else {
+    pwmVal = map(percent, 1, 100, 1136, PWM_MAX_US);  // Idle=1136µs, max=2000µs
+  }
+
+  if (motor == 1) {
+    pwmInsp = pwmVal;
+    Serial.print("Motor 1 auf ");
+    Serial.print(percent);
+    Serial.print("% -> PWM = ");
+    Serial.print(pwmVal);
+    Serial.println(" µs");
+  } 
+  else if (motor == 2) {
+    pwmExp = pwmVal;
+    Serial.print("Motor 2 auf ");
+    Serial.print(percent);
+    Serial.print("% -> PWM = ");
+    Serial.print(pwmVal);
+    Serial.println(" µs");
+  }
+}
+
+void stopMotors() {
+  pwmInsp = PWM_MIN_US;
+  pwmExp  = PWM_MIN_US;
+  escInsp.writeMicroseconds(pwmInsp);
+  escExp.writeMicroseconds(pwmExp);
+}
