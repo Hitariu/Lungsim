@@ -1,0 +1,143 @@
+#include <Servo.h>
+
+// ===== Pins =====
+Servo escExp;   // Motor 1 = Expiration
+Servo escInsp;  // Motor 2 = Inspiration
+const int EXP_PIN  = 9;    // Motor 1
+const int INSP_PIN = 11;   // Motor 2
+
+// ===== Taster =====
+const int BTN_START = 2;   // Taster 1 = Start
+const int BTN_STOP  = 4;   // Taster 3 = Stop
+
+// ===== PWM-Kennwerte =====
+const int PWM_MIN_US   = 1000;   // AUS
+const int PWM_MAX_US   = 2000;   // MAX
+const int PWM_IDLE_US  = 1136;   // ~1% (Anlauf)
+
+// ===== Normalatmung =====
+const unsigned long NORMAL_PHASE_MS = 800;
+const int NORMAL_REPEATS = 4;
+
+// ===== Volle Inspiration =====
+const float INSP_FULL_PERCENT = 8.0f;
+const unsigned long INSP_FULL_MS = 1000;
+
+// ===== Forcierte Expiration =====
+const unsigned long FORCED_TOTAL_MS = 5000;
+const unsigned long EXP_T1_MS = 200;     // 30 % für 20 ms
+const unsigned long EXP_T2_MS = 400;     // 20 % für 40 ms (bis 60 ms)
+const unsigned long EXP_RAMP_MS = 1000; // linear 20 % -> 1 % in 1000 ms
+
+// ===== Status =====
+bool running = false;
+
+// ===== Hilfsfunktionen =====
+int percentToPwm(float pct) {
+  if (pct <= 0.0f) return PWM_MIN_US;
+  if (pct < 1.0f)  pct = 1.0f;
+  if (pct > 100.0f) pct = 100.0f;
+  long us = map((long)pct, 1, 100, PWM_IDLE_US, PWM_MAX_US);
+  return (int)us;
+}
+
+void bothOff() {
+  escExp.writeMicroseconds(PWM_MIN_US);
+  escInsp.writeMicroseconds(PWM_MIN_US);
+}
+
+// ===== Sequenzen =====
+void runNormalBreathing() {
+  for (int i = 0; i < NORMAL_REPEATS && running; ++i) {
+    // Inspiration
+    escInsp.writeMicroseconds(percentToPwm(1.0f));
+    escExp.writeMicroseconds(PWM_MIN_US);
+    delay(NORMAL_PHASE_MS);
+
+    if (!running) break;
+
+    // Expiration
+    escInsp.writeMicroseconds(PWM_MIN_US);
+    escExp.writeMicroseconds(percentToPwm(1.0f));
+    delay(NORMAL_PHASE_MS);
+  }
+  bothOff();
+}
+
+void runFullInspiration() {
+  escInsp.writeMicroseconds(percentToPwm(INSP_FULL_PERCENT));
+  escExp.writeMicroseconds(PWM_MIN_US);
+  delay(INSP_FULL_MS);
+  bothOff();
+}
+
+void runForcedExpiration() {
+  unsigned long t0 = millis();
+  escInsp.writeMicroseconds(PWM_MIN_US);
+
+  // Phase A: 0–20 ms @ 30 %
+  escExp.writeMicroseconds(percentToPwm(100.0f));
+  delay(EXP_T1_MS);
+  if (!running) return;
+
+  // Phase B: 20–60 ms @ 20 %
+  escExp.writeMicroseconds(percentToPwm(60.0f));
+  delay(EXP_T2_MS);
+  if (!running) return;
+
+  // Phase C: 60–1060 ms linear 20 % -> 1 %
+  for (unsigned long ms = 0; ms < EXP_RAMP_MS && running; ms += 10) {
+    float frac = (float)ms / (float)EXP_RAMP_MS;
+    float pct  = 20.0f + (1.0f - 20.0f) * frac;
+    escExp.writeMicroseconds(percentToPwm(pct));
+    delay(10);
+  }
+
+  // Restzeit bis FORCED_TOTAL_MS halten @ 1 %
+  unsigned long dt = millis() - t0;
+  if (running && FORCED_TOTAL_MS > dt) {
+    escExp.writeMicroseconds(percentToPwm(1.0f));
+    delay(FORCED_TOTAL_MS - dt);
+  }
+
+  bothOff();
+}
+
+void setup() {
+  Serial.begin(9600);
+  escExp.attach(EXP_PIN);
+  escInsp.attach(INSP_PIN);
+  bothOff();
+  delay(3000);
+
+  pinMode(BTN_START, INPUT_PULLUP);
+  pinMode(BTN_STOP,  INPUT_PULLUP);
+
+  Serial.println("Bereit. Taster 1 = Start, Taster 3 = Stop.");
+}
+
+void loop() {
+  // Stop jederzeit
+  if (digitalRead(BTN_STOP) == LOW) {
+    running = false;
+    bothOff();
+    Serial.println(">>> STOP gedrückt: Sequenz beendet");
+    delay(300);
+  }
+
+  // Start
+  if (!running && digitalRead(BTN_START) == LOW) {
+    running = true;
+    Serial.println(">>> START gedrückt: Sequenz beginnt");
+
+    // Sequenz abspielen
+    runNormalBreathing();
+    if (running) runFullInspiration();
+    if (running) runForcedExpiration();
+
+    running = false; // am Ende automatisch stoppen
+    bothOff();
+    Serial.println(">>> Sequenz beendet");
+    delay(300);
+  }
+}
