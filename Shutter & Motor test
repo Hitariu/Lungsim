@@ -1,0 +1,184 @@
+#include <Servo.h>
+
+// ===== ESC / Motoren =====
+Servo escInsp;   // Motor 1 (Inspiration)
+Servo escExp;    // Motor 2 (Expiration)
+
+// ESC Pins
+const int ESC_INSP_PIN = 9;     // Motor 1 PWM
+const int ESC_EXP_PIN  = 10;    // Motor 2 PWM
+
+// PWM-Grenzen
+const int PWM_MIN_US   = 1000;  // Aus
+const int PWM_MAX_US   = 2000;  // Max (nach Kalibrierung)
+const int PWM_IDLE_US  = 1136;  // ≈ 1% (dein Anlaufpunkt)
+
+// aktuelle PWM-Werte
+int pwmInsp = PWM_MIN_US;
+int pwmExp  = PWM_MIN_US;
+
+// ===== Taster =====
+const int BTN_SHUT_CLOSE = 2;   // Taster 1: Shutter zu
+const int BTN_SHUT_OPEN  = 3;   // Taster 2: Shutter auf
+const int BTN_STOP       = 4;   // Taster 3: Motoren aus
+
+// ===== Relais (Shutter) =====
+// Deine Platine ist ACTIVE-HIGH
+const int ACTIVE_ON  = HIGH;
+const int ACTIVE_OFF = LOW;
+
+const int PIN_CLOSE = 12;       // Relais-Gruppe CLOSE (IN1/IN4 gebrückt)
+const int PIN_OPEN  = 13;       // Relais-Gruppe OPEN  (IN2/IN3 gebrückt)
+
+const unsigned long DEFAULT_PULSE_MS = 30;   // „sweet spot“
+const unsigned long BBM_MS           = 30;   // break-before-make
+const unsigned long PULSE_MIN_MS     = 1;
+const unsigned long PULSE_MAX_MS     = 2000;
+
+// Debounce für Taster
+const unsigned long DEBOUNCE_MS = 200;
+unsigned long lastBtnCloseMs = 0, lastBtnOpenMs = 0, lastBtnStopMs = 0;
+
+void setup() {
+  // ESCs
+  escInsp.attach(ESC_INSP_PIN);
+  escExp.attach(ESC_EXP_PIN);
+
+  // ESCs armen
+  escInsp.writeMicroseconds(PWM_MIN_US);
+  escExp.writeMicroseconds(PWM_MIN_US);
+  delay(3000);
+
+  // Taster
+  pinMode(BTN_SHUT_CLOSE, INPUT_PULLUP);
+  pinMode(BTN_SHUT_OPEN,  INPUT_PULLUP);
+  pinMode(BTN_STOP,       INPUT_PULLUP);
+
+  // Relais
+  pinMode(PIN_CLOSE, OUTPUT);
+  pinMode(PIN_OPEN,  OUTPUT);
+  digitalWrite(PIN_CLOSE, ACTIVE_OFF);
+  digitalWrite(PIN_OPEN,  ACTIVE_OFF);
+
+  // Serial
+  Serial.begin(9600);
+  Serial.println("Bereit.");
+  Serial.println("Konsole: motor1 <0-100> | motor2 <0-100> | stop | close [ms] | open [ms]");
+  Serial.println("Taster:  D2=Close | D3=Open | D4=Stop Motors");
+}
+
+void loop() {
+  // ===== Taster prüfen =====
+  unsigned long now = millis();
+
+  // Taster 1: Shutter zu (Close)
+  if (digitalRead(BTN_SHUT_CLOSE) == LOW && (now - lastBtnCloseMs) > DEBOUNCE_MS) {
+    lastBtnCloseMs = now;
+    shutterPulseExclusive(PIN_CLOSE, DEFAULT_PULSE_MS);
+    Serial.print("CLOSE pulse "); Serial.print(DEFAULT_PULSE_MS); Serial.println(" ms (via Taster 1)");
+  }
+
+  // Taster 2: Shutter auf (Open)
+  if (digitalRead(BTN_SHUT_OPEN) == LOW && (now - lastBtnOpenMs) > DEBOUNCE_MS) {
+    lastBtnOpenMs = now;
+    shutterPulseExclusive(PIN_OPEN, DEFAULT_PULSE_MS);
+    Serial.print("OPEN  pulse "); Serial.print(DEFAULT_PULSE_MS); Serial.println(" ms (via Taster 2)");
+  }
+
+  // Taster 3: Motoren aus
+  if (digitalRead(BTN_STOP) == LOW && (now - lastBtnStopMs) > DEBOUNCE_MS) {
+    lastBtnStopMs = now;
+    stopMotors();
+    Serial.println(">> STOP (Taster 3): Beide Motoren aus.");
+  }
+
+  // ===== Konsole auswerten =====
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    line.trim(); line.toLowerCase();
+    if (line.length() > 0) handleCommand(line);
+  }
+
+  // ===== ESC-Signale senden =====
+  escInsp.writeMicroseconds(pwmInsp);
+  escExp.writeMicroseconds(pwmExp);
+
+  delay(10);
+}
+
+// ---------------- Hilfsfunktionen ----------------
+
+void handleCommand(String line) {
+  int sp = line.indexOf(' ');
+  String cmd = (sp < 0) ? line : line.substring(0, sp);
+  String arg = (sp < 0) ? ""   : line.substring(sp + 1);
+  arg.trim();
+
+  if (cmd == "motor1") {
+    int val = arg.toInt();
+    setMotor(1, val);
+  } else if (cmd == "motor2") {
+    int val = arg.toInt();
+    setMotor(2, val);
+  } else if (cmd == "stop") {
+    stopMotors();
+    Serial.println(">> Beide Motoren gestoppt (Konsole).");
+  } else if (cmd == "close") {
+    unsigned long ms = parsePulse(arg);
+    shutterPulseExclusive(PIN_CLOSE, ms);
+    Serial.print("CLOSE pulse "); Serial.print(ms); Serial.println(" ms");
+  } else if (cmd == "open") {
+    unsigned long ms = parsePulse(arg);
+    shutterPulseExclusive(PIN_OPEN, ms);
+    Serial.print("OPEN  pulse "); Serial.print(ms); Serial.println(" ms");
+  } else {
+    Serial.println("Unbekannter Befehl! Syntax: motor1 <0-100>, motor2 <0-100>, stop, close [ms], open [ms]");
+  }
+}
+
+unsigned long parsePulse(const String& arg) {
+  if (arg.length() == 0) return DEFAULT_PULSE_MS;
+  long v = arg.toInt();
+  if (v <= 0) return DEFAULT_PULSE_MS;
+  return constrain((unsigned long)v, PULSE_MIN_MS, PULSE_MAX_MS);
+}
+
+void setMotor(int motor, int percent) {
+  percent = constrain(percent, 0, 100);
+  int pwmVal;
+  if (percent == 0) {
+    pwmVal = PWM_MIN_US;
+  } else {
+    // map 1..100 % auf Idle..Max
+    pwmVal = map(percent, 1, 100, PWM_IDLE_US, PWM_MAX_US);
+  }
+
+  if (motor == 1) {
+    pwmInsp = pwmVal;
+    Serial.print("Motor 1 auf "); Serial.print(percent);
+    Serial.print("% -> PWM = "); Serial.print(pwmVal); Serial.println(" µs");
+  } else if (motor == 2) {
+    pwmExp = pwmVal;
+    Serial.print("Motor 2 auf "); Serial.print(percent);
+    Serial.print("% -> PWM = "); Serial.print(pwmVal); Serial.println(" µs");
+  }
+}
+
+void stopMotors() {
+  pwmInsp = PWM_MIN_US;
+  pwmExp  = PWM_MIN_US;
+  escInsp.writeMicroseconds(pwmInsp);
+  escExp.writeMicroseconds(pwmExp);
+}
+
+// Relais: exklusiver Impuls mit break-before-make
+void shutterPulseExclusive(int pin, unsigned long ms) {
+  // beide Gruppen aus
+  digitalWrite(PIN_CLOSE, ACTIVE_OFF);
+  digitalWrite(PIN_OPEN,  ACTIVE_OFF);
+  delay(BBM_MS);
+  // Impuls auf gewünschte Gruppe
+  digitalWrite(pin, ACTIVE_ON);
+  delay(ms);
+  digitalWrite(pin, ACTIVE_OFF);
+}
