@@ -1,0 +1,71 @@
+const int ACTIVE_ON  = HIGH;
+const int ACTIVE_OFF = LOW;
+
+const int PIN_CLOSE = 12;            // drives relays 1 & 4 (group A)
+const int PIN_OPEN  = 13;            // drives relays 2 & 3 (group B)
+
+const unsigned long DEFAULT_PULSE_MS = 10;  // used if no number is provided
+const unsigned long BBM_MS           = 30;  // break-before-make safety gap
+const unsigned long PULSE_MIN_MS     = 1;   // sanity limits
+const unsigned long PULSE_MAX_MS     = 2000;
+
+void setup() {
+  pinMode(PIN_CLOSE, OUTPUT);
+  pinMode(PIN_OPEN,  OUTPUT);
+
+  // idle state: both inputs OFF
+  digitalWrite(PIN_CLOSE, ACTIVE_OFF);
+  digitalWrite(PIN_OPEN,  ACTIVE_OFF);
+
+  Serial.begin(9600);
+  Serial.println("Ready. Commands:");
+  Serial.println("  close [ms]   -> pulse D12 (default 10ms)");
+  Serial.println("  open  [ms]   -> pulse D13 (default 10ms)");
+  Serial.println("Examples: close    | close 20 | open 15");
+}
+
+void loop() {
+  if (!Serial.available()) return;
+
+  String line = Serial.readStringUntil('\n');
+  line.trim(); line.toLowerCase();
+  if (line.length() == 0) return;
+
+  // ----- split into word + optional number -----
+  int sp = line.indexOf(' ');
+  String cmd = (sp < 0) ? line : line.substring(0, sp);
+  String arg = (sp < 0) ? ""   : line.substring(sp + 1);
+  arg.trim();
+
+  unsigned long pulseMs = DEFAULT_PULSE_MS;
+  if (arg.length() > 0) {
+    long v = arg.toInt();
+    if (v > 0) pulseMs = constrain((unsigned long)v, PULSE_MIN_MS, PULSE_MAX_MS);
+  }
+
+  if (cmd == "close") {
+    pulseExclusive(PIN_CLOSE, pulseMs);
+    Serial.print("CLOSE pulse "); Serial.print(pulseMs); Serial.println(" ms");
+  } else if (cmd == "open") {
+    pulseExclusive(PIN_OPEN, pulseMs);
+    Serial.print("OPEN  pulse "); Serial.print(pulseMs); Serial.println(" ms");
+  } else {
+    Serial.println("Unknown command. Use: close [ms] | open [ms]");
+  }
+}
+
+void pulseExclusive(int pin) {
+  pulseExclusive(pin, DEFAULT_PULSE_MS);
+}
+
+void pulseExclusive(int pin, unsigned long ms) {
+  // Make sure both groups are OFF first (break-before-make)
+  digitalWrite(PIN_CLOSE, ACTIVE_OFF);
+  digitalWrite(PIN_OPEN,  ACTIVE_OFF);
+  delay(BBM_MS);
+
+  // Pulse the requested group
+  digitalWrite(pin, ACTIVE_ON);
+  delay(ms);
+  digitalWrite(pin, ACTIVE_OFF);
+}
