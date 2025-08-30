@@ -1,0 +1,393 @@
+#include <Servo.h>
+
+// ===== Pins =====
+const int ESC_M1_PIN = 9;     // Motor 1 (Inspiration)
+const int ESC_M2_PIN = 10;    // Motor 2 (Expiration)
+const int BTN_START  = 2;     // Start (LOW = pressed)
+const int BTN_STOP   = 4;     // Stop  (LOW = pressed)
+const int SHUTTER_CLOSE_PIN = 12; // Relay CLOSE (ACTIVE-HIGH)
+const int SHUTTER_OPEN_PIN  = 13; // Relay OPEN  (ACTIVE-HIGH)
+const int RELAY_ACTIVE_ON   = HIGH;
+const int RELAY_ACTIVE_OFF  = LOW;
+
+// ===== ESC / PWM =====
+const int PWM_MIN_US  = 1000;
+const int PWM_MAX_US  = 2000;
+const int PWM_IDLE_US = 1136;
+
+// Debounce
+const unsigned long DEBOUNCE_MS = 180;
+
+// ===== Step 1 defaults (live tweakable) =====
+unsigned long S1_ON_TIME_MS = 800;
+int           S1_REPEATS    = 4;
+
+// ===== Step 2 defaults (live tweakable) =====
+unsigned long S2_ON_TIME_MS = 1000;
+float         S2_PERCENT    = 8.0f;
+
+// ===== Step 3 defaults (LIVE TWEAKABLE) =====
+// Pulses
+unsigned long S3_CLOSE_PULSE_MS = 30;   // CLOSE pulse width (ms)
+unsigned long S3_OPEN_PULSE_MS  = 30;   // OPEN  pulse width (ms)
+// Timing
+unsigned long S3_OPEN_AT_MS     = 420;  // when OPEN starts (ms from Step 3 start)  (set open_at 420)
+// Profile
+float         S3A_JUMP_TO       = 52.0f;    // M2 peak jump (%)                     (set jump 52)
+unsigned long S3B_LINEAR_MS     = 450;      // linear duration (ms)                  (set linear_ms 450)
+float         S3B_LINEAR_TO     = 17.0f;    // linear target (%)                     (set linear_to 17)
+unsigned long S3C_EXP_MS        = 3000;     // exponential duration (ms)
+float         S3C_TAU_MS        = 450.0f;   // exponential time constant (ms)        (set tau_ms 450)
+unsigned long S3D_HOLD_1PCT_MS  = 200;      // hold both @1% (ms)                    (set hold_ms 200)
+// All-off hold before 3F
+unsigned long S3E1_ALL_OFF_MS   = 600;      // BOTH OFF (true off)                   (set e1_ms 600)
+// Post
+float         S3F_POST_M1_PCT   = 7.0f;     // M1 post %                             (set post_m1_pct 7)
+unsigned long S3F_POST_M1_MS    = 1300;     // M1 post duration (ms)                 (set post_m1_ms 1300)
+
+// ===== State machine =====
+enum Phase {
+  IDLE,
+  // Step 1
+  S1_M1_ON, S1_M1_OFF, S1_M2_ON, S1_M2_OFF,
+  // Step 2
+  S2_M1_ON, S2_M1_OFF,
+  // Step 3 split:
+  S3A_CLOSE_AND_JUMP,    // t=0: CLOSE pulse (30ms), wait until t=open_at; M2 = jump; M1=1%
+  S3B_OPEN_AND_LINEAR,   // at t=open_at: OPEN pulse (30ms); M2 linear peak->target over linear_ms; M1=1%
+  S3C_EXP_DECAY,         // then M2 exp target->~1% over exp_ms; M1=1%
+  S3D_HOLD_1PCT,         // both motors @1% for hold_ms
+  S3E_M2_OFF,            // M2 off
+  S3E1_ALL_OFF,          // both OFF (true off) for S3E1_ALL_OFF_MS
+  S3F_M1_POST_ON,        // M1 post %
+  S3G_M1_POST_OFF        // M1 off -> end
+};
+
+Servo escM1, escM2;
+bool running = false;
+Phase phase = IDLE;
+unsigned long phaseStart = 0;
+int s1Cycles = 0;
+
+// OPEN pulse management
+bool openPulseActive = false;
+unsigned long openPulseStart = 0;
+
+// ===== Helpers =====
+int percentToPwm(float pct) {
+  if (pct <= 0.0f) return PWM_MIN_US;  // true off
+  if (pct < 1.0f)  pct = 1.0f;         // keep ≥ idle when "on"
+  if (pct > 100.0f) pct = 100.0f;
+  long us = map((long)pct, 1, 100, PWM_IDLE_US, PWM_MAX_US);
+  return (int)us;
+}
+void motorsOff() { escM1.writeMicroseconds(PWM_MIN_US); escM2.writeMicroseconds(PWM_MIN_US); }
+void shutterAllOff() { digitalWrite(SHUTTER_CLOSE_PIN, RELAY_ACTIVE_OFF); digitalWrite(SHUTTER_OPEN_PIN, RELAY_ACTIVE_OFF); }
+
+void setPhase(Phase p) {
+  phase = p;
+  phaseStart = millis();
+
+  switch (phase) {
+    // ---- Step 1 ----
+    case S1_M1_ON:
+      escM1.writeMicroseconds(percentToPwm(1.0f));
+      escM2.writeMicroseconds(PWM_MIN_US);
+      Serial.print("[Step1] M1 = 1% ("); Serial.print(S1_ON_TIME_MS); Serial.println(" ms)"); break;
+
+    case S1_M1_OFF: motorsOff(); Serial.println("[Step1] M1 = AUS"); break;
+
+    case S1_M2_ON:
+      escM1.writeMicroseconds(PWM_MIN_US);
+      escM2.writeMicroseconds(percentToPwm(1.0f));
+      Serial.print("[Step1] M2 = 1% ("); Serial.print(S1_ON_TIME_MS); Serial.println(" ms)"); break;
+
+    case S1_M2_OFF: motorsOff(); Serial.println("[Step1] M2 = AUS"); break;
+
+    // ---- Step 2 ----
+    case S2_M1_ON:
+      escM1.writeMicroseconds(percentToPwm(S2_PERCENT));
+      escM2.writeMicroseconds(PWM_MIN_US);
+      Serial.print("[Step2] M1 = "); Serial.print(S2_PERCENT); Serial.print("% (");
+      Serial.print(S2_ON_TIME_MS); Serial.println(" ms)"); break;
+
+    case S2_M1_OFF: motorsOff(); Serial.println("[Step2] M1 = AUS"); break;
+
+    // ---- Step 3 ----
+    case S3A_CLOSE_AND_JUMP:
+      shutterAllOff();
+      digitalWrite(SHUTTER_CLOSE_PIN, RELAY_ACTIVE_ON);          // CLOSE pulse begins
+      escM1.writeMicroseconds(percentToPwm(1.0f));               // M1 fixed 1%
+      escM2.writeMicroseconds(percentToPwm(S3A_JUMP_TO));        // M2 jump to peak
+      openPulseActive = false;
+      Serial.print("[Step3A] t=0: CLOSE "); Serial.print(S3_CLOSE_PULSE_MS);
+      Serial.print(" ms; window until t="); Serial.print(S3_OPEN_AT_MS);
+      Serial.print(" ms; M2="); Serial.print(S3A_JUMP_TO); Serial.println("%; M1=1%");
+      break;
+
+    case S3B_OPEN_AND_LINEAR:
+      digitalWrite(SHUTTER_OPEN_PIN, RELAY_ACTIVE_ON);           // OPEN pulse begins
+      openPulseActive = true;
+      openPulseStart  = millis();
+      escM1.writeMicroseconds(percentToPwm(1.0f));
+      Serial.print("[Step3B] t="); Serial.print(S3_OPEN_AT_MS);
+      Serial.print(" ms: OPEN "); Serial.print(S3_OPEN_PULSE_MS);
+      Serial.print(" ms; M2 linear "); Serial.print(S3A_JUMP_TO); Serial.print("% -> ");
+      Serial.print(S3B_LINEAR_TO); Serial.print("% ("); Serial.print(S3B_LINEAR_MS);
+      Serial.println(" ms)");
+      break;
+
+    case S3C_EXP_DECAY:
+      digitalWrite(SHUTTER_OPEN_PIN, RELAY_ACTIVE_OFF);
+      escM1.writeMicroseconds(percentToPwm(1.0f));
+      Serial.print("[Step3C] M2 exp "); Serial.print(S3B_LINEAR_TO);
+      Serial.print("% -> ~1% ("); Serial.print(S3C_EXP_MS);
+      Serial.print(" ms), tau="); Serial.print(S3C_TAU_MS); Serial.println(" ms; M1=1%");
+      break;
+
+    case S3D_HOLD_1PCT:
+      escM1.writeMicroseconds(percentToPwm(1.0f));
+      escM2.writeMicroseconds(percentToPwm(1.0f));
+      Serial.print("[Step3D] BOTH @1% ("); Serial.print(S3D_HOLD_1PCT_MS); Serial.println(" ms)"); break;
+
+    case S3E_M2_OFF: 
+      escM2.writeMicroseconds(PWM_MIN_US); 
+      Serial.println("[Step3E] M2 = AUS"); 
+      break;
+
+    case S3E1_ALL_OFF:
+      // both true off for S3E1_ALL_OFF_MS
+      escM1.writeMicroseconds(PWM_MIN_US);
+      escM2.writeMicroseconds(PWM_MIN_US);
+      Serial.print("[Step3E_1] BOTH OFF ("); Serial.print(S3E1_ALL_OFF_MS); Serial.println(" ms)");
+      break;
+
+    case S3F_M1_POST_ON:
+      escM1.writeMicroseconds(percentToPwm(S3F_POST_M1_PCT));
+      Serial.print("[Step3F] M1 = "); Serial.print(S3F_POST_M1_PCT);
+      Serial.print("% ("); Serial.print(S3F_POST_M1_MS); Serial.println(" ms)"); break;
+
+    case S3G_M1_POST_OFF: 
+      motorsOff(); 
+      Serial.println("[Step3G] M1 = AUS (Ende)"); 
+      break;
+
+    case IDLE:
+    default: 
+      motorsOff(); shutterAllOff(); 
+      Serial.println("[IDLE] Beide Motoren AUS"); 
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  escM1.attach(ESC_M1_PIN);
+  escM2.attach(ESC_M2_PIN);
+
+  pinMode(BTN_START, INPUT_PULLUP);
+  pinMode(BTN_STOP,  INPUT_PULLUP);
+
+  pinMode(SHUTTER_CLOSE_PIN, OUTPUT);
+  pinMode(SHUTTER_OPEN_PIN,  OUTPUT);
+  shutterAllOff();
+
+  motorsOff();
+  delay(3000); // arm ESCs
+
+  Serial.println("Ready. Buttons: START=D2, STOP=D4. Type 'help' for commands.");
+  setPhase(IDLE);
+}
+
+void loop() {
+  static unsigned long lastStartRead = 0, lastStopRead = 0;
+  unsigned long now = millis();
+
+  // STOP button
+  if (digitalRead(BTN_STOP) == LOW && (now - lastStopRead) > DEBOUNCE_MS) {
+    lastStopRead = now; running = false; setPhase(IDLE); s1Cycles = 0; return;
+  }
+  // START button
+  if (!running && digitalRead(BTN_START) == LOW && (now - lastStartRead) > DEBOUNCE_MS) {
+    lastStartRead = now; running = true; s1Cycles = 0;
+    Serial.println(">>> START: Step1 -> Step2 -> Step3A..3G + 3E_1");
+    setPhase(S1_M1_ON);
+  }
+
+  // Serial commands
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n'); line.trim(); line.toLowerCase();
+    if (line.length()) handleCommand(line);
+  }
+
+  if (!running) return;
+
+  switch (phase) {
+    // ===== Step 1 =====
+    case S1_M1_ON:  if (now - phaseStart >= S1_ON_TIME_MS) setPhase(S1_M1_OFF); break;
+    case S1_M1_OFF: setPhase(S1_M2_ON); break;
+    case S1_M2_ON:  if (now - phaseStart >= S1_ON_TIME_MS) setPhase(S1_M2_OFF); break;
+    case S1_M2_OFF:
+      s1Cycles++;
+      if (s1Cycles >= S1_REPEATS) setPhase(S2_M1_ON);
+      else                        setPhase(S1_M1_ON);
+      break;
+
+    // ===== Step 2 =====
+    case S2_M1_ON:  if (now - phaseStart >= S2_ON_TIME_MS) setPhase(S2_M1_OFF); break;
+    case S2_M1_OFF: setPhase(S3A_CLOSE_AND_JUMP); break;
+
+    // ===== Step 3 =====
+    case S3A_CLOSE_AND_JUMP: {
+      unsigned long t = now - phaseStart; // since Step 3 start
+      if (t >= S3_CLOSE_PULSE_MS) digitalWrite(SHUTTER_CLOSE_PIN, RELAY_ACTIVE_OFF); // end CLOSE pulse
+      if (t >= S3_OPEN_AT_MS)     setPhase(S3B_OPEN_AND_LINEAR);                     // move on at OPEN_AT
+    } break;
+
+    case S3B_OPEN_AND_LINEAR: {
+      if (openPulseActive && (now - openPulseStart >= S3_OPEN_PULSE_MS)) {
+        digitalWrite(SHUTTER_OPEN_PIN, RELAY_ACTIVE_OFF); openPulseActive = false;
+      }
+      unsigned long t = now - phaseStart; // 0..linear_ms
+      if (t <= S3B_LINEAR_MS) {
+        float pct = S3A_JUMP_TO + (S3B_LINEAR_TO - S3A_JUMP_TO) * ((float)t / (float)S3B_LINEAR_MS);
+        escM2.writeMicroseconds(percentToPwm(pct));
+      } else {
+        escM2.writeMicroseconds(percentToPwm(S3B_LINEAR_TO));
+        setPhase(S3C_EXP_DECAY);
+      }
+    } break;
+
+    case S3C_EXP_DECAY: {
+      unsigned long t = now - phaseStart; // 0..exp_ms
+      if (t <= S3C_EXP_MS) {
+        float p0  = S3B_LINEAR_TO; // 17%
+        float pct = 1.0f + (p0 - 1.0f) * expf(- (float)t / S3C_TAU_MS); // floor at 1%
+        if (pct < 1.0f) pct = 1.0f;
+        escM2.writeMicroseconds(percentToPwm(pct));
+      } else {
+        setPhase(S3D_HOLD_1PCT);
+      }
+    } break;
+
+    case S3D_HOLD_1PCT:
+      if (now - phaseStart >= S3D_HOLD_1PCT_MS) setPhase(S3E_M2_OFF);
+      break;
+
+    case S3E_M2_OFF:
+      setPhase(S3E1_ALL_OFF);  // insert all-off hold before 3F
+      break;
+
+    case S3E1_ALL_OFF:
+      if (now - phaseStart >= S3E1_ALL_OFF_MS) setPhase(S3F_M1_POST_ON);
+      break;
+
+    case S3F_M1_POST_ON:
+      if (now - phaseStart >= S3F_POST_M1_MS) setPhase(S3G_M1_POST_OFF);
+      break;
+
+    case S3G_M1_POST_OFF:
+      running = false; setPhase(IDLE);
+      Serial.println(">>> Sequence complete (Step1 + Step2 + Step3A..3G + 3E_1).");
+      break;
+
+    default: break;
+  }
+}
+
+// ================= Serial command handler =================
+
+void handleCommand(String line) {
+  if (line == "help") { printHelp(); return; }
+  if (line == "show") { printParams(); return; }
+  if (line == "start") { if (!running) { running = true; s1Cycles=0; Serial.println(">>> START (serial)"); setPhase(S1_M1_ON);} return; }
+  if (line == "stop")  { running = false; setPhase(IDLE); s1Cycles=0; Serial.println(">>> STOP (serial)"); return; }
+
+  if (!line.startsWith("set ")) {
+    Serial.println("Unknown. Type 'help' for commands.");
+    return;
+  }
+
+  // parse: set <name> <value>
+  int sp = line.indexOf(' ');
+  int sp2 = line.indexOf(' ', sp+1);
+  if (sp2 < 0) { Serial.println("Usage: set <name> <value>"); return; }
+
+  String name = line.substring(sp+1, sp2); name.trim();
+  String sval = line.substring(sp2+1);     sval.trim();
+
+  long   vi = sval.toInt();
+  float  vf = sval.toFloat();
+  unsigned long vum = (unsigned long)max(0L, vi);
+
+  bool ok = true;
+
+  if (name == "jump")            { S3A_JUMP_TO = constrain(vf, 1.0f, 100.0f); }
+  else if (name == "open_at")    { S3_OPEN_AT_MS = vum; }
+  else if (name == "close_ms")   { S3_CLOSE_PULSE_MS = vum; }
+  else if (name == "open_ms")    { S3_OPEN_PULSE_MS  = vum; }
+  else if (name == "linear_ms")  { S3B_LINEAR_MS = vum; }
+  else if (name == "linear_to")  { S3B_LINEAR_TO = constrain(vf, 1.0f, 100.0f); }
+  else if (name == "exp_ms")     { S3C_EXP_MS = vum; }
+  else if (name == "tau_ms")     { S3C_TAU_MS = max(1.0f, vf); }
+  else if (name == "hold_ms")    { S3D_HOLD_1PCT_MS = vum; }
+  else if (name == "e1_ms")      { S3E1_ALL_OFF_MS = vum; }
+  else if (name == "post_m1_pct"){ S3F_POST_M1_PCT = constrain(vf, 1.0f, 100.0f); }
+  else if (name == "post_m1_ms") { S3F_POST_M1_MS = vum; }
+  else if (name == "s1_on")      { S1_ON_TIME_MS = vum; }
+  else if (name == "s1_rep")     { S1_REPEATS = (int)constrain((long)vi, 1L, 50L); }
+  else if (name == "s2_pct")     { S2_PERCENT = constrain(vf, 1.0f, 100.0f); }
+  else if (name == "s2_ms")      { S2_ON_TIME_MS = vum; }
+  else { ok = false; }
+
+  if (ok) {
+    Serial.print("OK set "); Serial.print(name); Serial.print(" = "); Serial.println(sval);
+  } else {
+    Serial.print("Unknown param '"); Serial.print(name); Serial.println("'. Type 'help'.");
+  }
+}
+
+void printParams() {
+  Serial.println("=== Current parameters ===");
+  Serial.print("S1: on="); Serial.print(S1_ON_TIME_MS); Serial.print(" ms, rep="); Serial.println(S1_REPEATS);
+  Serial.print("S2: pct="); Serial.print(S2_PERCENT); Serial.print("%, ms="); Serial.println(S2_ON_TIME_MS);
+
+  Serial.print("S3 pulses: close_ms="); Serial.print(S3_CLOSE_PULSE_MS);
+  Serial.print(", open_ms="); Serial.println(S3_OPEN_PULSE_MS);
+
+  Serial.print("S3 timing: open_at="); Serial.print(S3_OPEN_AT_MS); Serial.println(" ms");
+
+  Serial.print("S3 peak/linear: jump="); Serial.print(S3A_JUMP_TO);
+  Serial.print("%, linear_to="); Serial.print(S3B_LINEAR_TO);
+  Serial.print("%, linear_ms="); Serial.println(S3B_LINEAR_MS);
+
+  Serial.print("S3 exp: exp_ms="); Serial.print(S3C_EXP_MS);
+  Serial.print(", tau_ms="); Serial.println(S3C_TAU_MS);
+
+  Serial.print("S3 hold: hold_ms="); Serial.println(S3D_HOLD_1PCT_MS);
+
+  Serial.print("S3 all-off: e1_ms="); Serial.println(S3E1_ALL_OFF_MS);
+
+  Serial.print("S3 post M1: pct="); Serial.print(S3F_POST_M1_PCT);
+  Serial.print("%, ms="); Serial.println(S3F_POST_M1_MS);
+  Serial.println("==========================");
+}
+
+void printHelp() {
+  Serial.println("Commands:");
+  Serial.println("  start | stop | show | help");
+  Serial.println("  set jump <pct>        (peak %, e.g. 60)");
+  Serial.println("  set open_at <ms>      (when OPEN starts from Step3 start)");
+  Serial.println("  set close_ms <ms>     (CLOSE pulse width)");
+  Serial.println("  set open_ms <ms>      (OPEN  pulse width)");
+  Serial.println("  set linear_ms <ms>    (duration of linear segment)");
+  Serial.println("  set linear_to <pct>   (end % of linear segment)");
+  Serial.println("  set exp_ms <ms>       (duration of exponential segment)");
+  Serial.println("  set tau_ms <ms>       (time constant of exponential)");
+  Serial.println("  set hold_ms <ms>      (hold both motors @1%)");
+  Serial.println("  set e1_ms <ms>        (ALL-OFF hold before Step3F)");
+  Serial.println("  set post_m1_pct <pct> (M1 % after Step3)");
+  Serial.println("  set post_m1_ms <ms>   (M1 post duration)");
+  Serial.println("  set s1_on <ms> | set s1_rep <n> | set s2_pct <pct> | set s2_ms <ms>");
+}
